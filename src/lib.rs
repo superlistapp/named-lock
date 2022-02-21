@@ -5,10 +5,11 @@
 //!
 //! ```rust
 //! use named_lock::NamedLock;
+//! use named_lock::LockName;
 //! use named_lock::Result;
 //!
 //! fn main() -> Result<()> {
-//!     let lock = NamedLock::create("foobar")?;
+//!     let lock = NamedLock::create(LockName{name: "foobar".into(), path: None})?;
 //!     let _guard = lock.lock()?;
 //!
 //!     // Do something...
@@ -31,6 +32,7 @@
 use once_cell::sync::Lazy;
 use parking_lot::{Mutex, MutexGuard};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
 mod error;
@@ -56,7 +58,7 @@ use crate::windows::RawNamedLock;
 // re-lock it. To avoid this, we ensure that one `HANDLE` exists in each
 // process for each name.
 static OPENED_RAW_LOCKS: Lazy<
-    Mutex<HashMap<String, Weak<Mutex<RawNamedLock>>>>,
+    Mutex<HashMap<LockName, Weak<Mutex<RawNamedLock>>>>,
 > = Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Cross-process lock that is identified by name.
@@ -65,20 +67,26 @@ pub struct NamedLock {
     raw: Arc<Mutex<RawNamedLock>>,
 }
 
+#[derive(PartialEq, Eq, Hash)]
+pub struct LockName {
+    pub name: String,
+    pub path: Option<PathBuf>,
+}
+
 impl NamedLock {
     /// Create/open a named lock.
     ///
     /// On UNIX systems this will create/open a file at `/tmp/<name>.lock`.
     ///
     /// On Windows this will create/open a named mutex.
-    pub fn create(name: &str) -> Result<NamedLock> {
+    pub fn create(name: LockName) -> Result<NamedLock> {
         let mut opened_locks = OPENED_RAW_LOCKS.lock();
 
-        let lock = match opened_locks.get(name).and_then(|x| x.upgrade()) {
+        let lock = match opened_locks.get(&name).and_then(|x| x.upgrade()) {
             Some(lock) => lock,
             None => {
-                let lock = Arc::new(Mutex::new(RawNamedLock::create(name)?));
-                opened_locks.insert(name.to_owned(), Arc::downgrade(&lock));
+                let lock = Arc::new(Mutex::new(RawNamedLock::create(&name)?));
+                opened_locks.insert(name, Arc::downgrade(&lock));
                 lock
             }
         };
@@ -91,7 +99,7 @@ impl NamedLock {
     /// Try to lock named lock.
     ///
     /// If it is already locked, `Error::WouldBlock` will be returned.
-    pub fn try_lock<'r>(&'r self) -> Result<NamedLockGuard<'r>> {
+    pub fn try_lock(&self) -> Result<NamedLockGuard<'_>> {
         let guard = self.raw.try_lock().ok_or(Error::WouldBlock)?;
 
         guard.try_lock()?;
@@ -102,7 +110,7 @@ impl NamedLock {
     }
 
     /// Lock named lock.
-    pub fn lock<'r>(&'r self) -> Result<NamedLockGuard<'r>> {
+    pub fn lock(&self) -> Result<NamedLockGuard<'_>> {
         let guard = self.raw.lock();
 
         guard.lock()?;
@@ -135,6 +143,15 @@ mod tests {
     use std::time::Duration;
     use uuid::Uuid;
 
+    impl From<String> for LockName {
+        fn from(name: String) -> Self {
+            LockName {
+                name: name,
+                path: None,
+            }
+        }
+    }
+
     fn call_proc_num(num: u32, uuid: &str) -> Child {
         let exe = env::current_exe().expect("no exe");
         let mut cmd = Command::new(exe);
@@ -163,7 +180,7 @@ mod tests {
                 let mut handle2 = call_proc_num(2, &uuid);
                 sleep(Duration::from_millis(200));
 
-                let lock = NamedLock::create(&uuid)?;
+                let lock = NamedLock::create(uuid.into())?;
                 assert_matches!(lock.try_lock(), Err(Error::WouldBlock));
                 lock.lock().expect("failed to lock");
 
@@ -171,16 +188,16 @@ mod tests {
                 assert!(handle1.wait().unwrap().success());
             }
             1 => {
-                let lock =
-                    NamedLock::create(&uuid).expect("failed to create lock");
+                let lock = NamedLock::create(uuid.into())
+                    .expect("failed to create lock");
 
                 let _guard = lock.lock().expect("failed to lock");
                 assert_matches!(lock.try_lock(), Err(Error::WouldBlock));
                 sleep(Duration::from_millis(200));
             }
             2 => {
-                let lock =
-                    NamedLock::create(&uuid).expect("failed to create lock");
+                let lock = NamedLock::create(uuid.into())
+                    .expect("failed to create lock");
 
                 assert_matches!(lock.try_lock(), Err(Error::WouldBlock));
                 let _guard = lock.lock().expect("failed to lock");
@@ -195,8 +212,8 @@ mod tests {
     #[test]
     fn edge_cases() -> Result<()> {
         let uuid = Uuid::new_v4().to_hyphenated().to_string();
-        let lock1 = NamedLock::create(&uuid)?;
-        let lock2 = NamedLock::create(&uuid)?;
+        let lock1 = NamedLock::create(uuid.clone().into())?;
+        let lock2 = NamedLock::create(uuid.into())?;
 
         {
             let _guard1 = lock1.try_lock()?;

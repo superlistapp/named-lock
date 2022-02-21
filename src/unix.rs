@@ -4,7 +4,7 @@ use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::Path;
 
-use crate::error::*;
+use crate::{error::*, LockName};
 
 #[derive(Debug)]
 pub(crate) struct RawNamedLock {
@@ -12,8 +12,12 @@ pub(crate) struct RawNamedLock {
 }
 
 impl RawNamedLock {
-    pub(crate) fn create(name: &str) -> Result<RawNamedLock> {
-        let lock_path = Path::new("/tmp").join(format!("{}.lock", name));
+    pub(crate) fn create(name: &LockName) -> Result<RawNamedLock> {
+        let lock_path = name
+            .path
+            .as_deref()
+            .unwrap_or_else(|| Path::new("/tmp"))
+            .join(format!("{}.lock", name.name));
 
         let lock_file = OpenOptions::new()
             .write(true)
